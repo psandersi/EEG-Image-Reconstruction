@@ -1,1 +1,13 @@
-Datasets/Raw
+**/.ipynb_checkpoints/**
+
+Datasets/Data
+Datasets/Target_Experiments_seq
+Generated/Data
+topomap_frames
+
+
+eeg_channel.mp3
+S_1_alpha_localization.png
+S_2_alpha_localization.png
+S_3_alpha_localization.png
+topomap_30Hz.gif

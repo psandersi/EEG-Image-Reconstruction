@@ -3,10 +3,12 @@
 import pandas as pd 
 import os
 import json
+import ast
 import mne
 from mne.preprocessing import ICA, create_eog_epochs, create_ecg_epochs
 import numpy as np
 from scipy.stats import pearsonr
+from scipy.signal import resample
 import re
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
@@ -42,7 +44,8 @@ def preprocess(core_path):
     s_name = os.path.basename(os.path.dirname(core_path))
     trial_name = os.path.basename(core_path)
 
-    save_path = f"./Generated/Data/{s_name}/{trial_name}/"
+    save_path_all = f"./Generated/Data/{s_name}/{trial_name}/"
+    save_path_training = f"./Generated/Data_Train/{s_name}/{trial_name}/"
     
     properties_path = f'{core_path}/EEG_Properties.json'
     datablocks_path = f'{core_path}/EEG.csv'
@@ -69,7 +72,7 @@ def preprocess(core_path):
         experiment_duration = sum(block['content'].get('duration') for block in experiment_seq.values())
     
     # Load eyetracker
-    eye_raw = mne.io.read_raw_eyelink(eyetracker_path, verbose=False)
+    eye_raw = mne.io.read_raw_eyelink(eyetracker_path, verbose='ERROR')
     
     # Load EEG itself
     eeg_df = pd.read_csv(datablocks_path, header=None, names=['block_id']+chan_names)
@@ -193,7 +196,7 @@ def preprocess(core_path):
         saccade_signal[start:end] = 1
     
     # Применяем ICA к EEG данным
-    ica = ICA(n_components=20, random_state=42, verbose=False)
+    ica = ICA(n_components=20, random_state=42, verbose='ERROR')
     ica.fit(eeg_raw)
     
     # Получаем ICA источники
@@ -231,7 +234,7 @@ def preprocess(core_path):
     ica.exclude = bads
     
     # Применяем ICA для очистки данных
-    eeg_raw = ica.apply(eeg_raw.copy(), verbose=False)
+    eeg_raw = ica.apply(eeg_raw.copy(), verbose='ERROR')
     
     
     # TODO --------------------------------------------------------------------------------------------------------
@@ -247,10 +250,64 @@ def preprocess(core_path):
     # eeg_raw.interpolate_bads(reset_bads=True)
     
     # Save
-    os.makedirs(save_path, exist_ok=True)
-    eeg_raw.save(f'{save_path}EEG_clean.fif', overwrite=True)
+    os.makedirs(save_path_all, exist_ok=True)
+    eeg_raw.save(f'{save_path_all}EEG_clean.fif', overwrite=True, verbose='ERROR')
     
     
+
+
+
+    annotations = eye_raw.annotations
+    sfreq = eye_raw.info['sfreq']
+    n_times = eye_raw.n_times
+    
+    # Создаём бинарные временные ряды
+    def create_event_channel(event_name):
+        signal = np.zeros(n_times)
+        for onset, duration, desc in zip(annotations.onset, annotations.duration, annotations.description):
+            if desc == event_name:
+                start = int(onset * sfreq)
+                end = int((onset + duration) * sfreq)
+                signal[start:end] = 1.0
+        return signal
+    
+    blink_signal = create_event_channel('blink')
+    saccade_signal = create_event_channel('saccade')
+    
+    # Извлекаем и нормализуем x, y, pupil
+    def zscore(x):
+        return (x - np.nanmean(x)) / np.nanstd(x)
+    
+    eye_x = eye_raw.get_data(picks='xpos_left')[0]
+    eye_y = eye_raw.get_data(picks='ypos_left')[0]
+    eye_pupil = eye_raw.get_data(picks='pupil_left')[0]
+    
+    eye_x = zscore(eye_x)
+    eye_y = zscore(eye_y)
+    eye_pupil = zscore(eye_pupil)
+    
+    # Собираем всё вместе
+    data = np.vstack([
+        eye_x,
+        eye_y,
+        eye_pupil,
+        blink_signal,
+        saccade_signal
+    ])
+    
+    ch_names = ['EOG_x', 'EOG_y', 'EOG_pupil', 'EOG_blink', 'EOG_saccade']
+    ch_types = ['eog'] * len(ch_names)
+    
+    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
+    eye_raw = mne.io.RawArray(data, info)
+    
+    # Save all the experiment EOG
+    eye_raw.save(f'{save_path_all}/EOG_clean.fif', overwrite=True, verbose='ERROR')
+
+
+
+
+
     
     
     
@@ -294,10 +351,96 @@ def preprocess(core_path):
         timestamp += block_data['content']['duration']
     
     # Save updated experiment sequence .json file
-    experiment_path = f'{save_path}Experiment.json'
+    experiment_path = f'{save_path_all}Experiment.json'
     with open(experiment_path, "w", encoding="utf-8") as f:
         json.dump(experiment_seq, f, indent=2, ensure_ascii=False)
 
+
+
+
+    # Define execution_times as before
+    execution_times = [
+        (block_data['timestamp'], block_data['content']['duration'])
+        for block_data in experiment_seq.values()
+        if block_data['type'] == 'execution'
+    ]
+    
+    t_plus = 0.5     # seconds
+    t_minus = 0.5   # seconds
+    expected_duration = int((t_minus + 15 + t_plus) * sr)  # in samples
+    
+    execution_eeg_epochs = []
+    execution_eye_epochs = []
+    
+    for i, (start_time, duration) in enumerate(execution_times):
+        
+        start_sample = start_time - t_minus  # in sec
+        stop_sample = min((start_time + duration + t_plus), len(eeg_raw) / sr - 0.001) # in sec
+        
+        eeg_segment = eeg_raw.copy().crop(tmin=start_sample, tmax=stop_sample, verbose=False)
+        eye_segment = eye_raw.copy().crop(tmin=start_sample, tmax=stop_sample, verbose=False)
+        eeg_data = eeg_segment.get_data()  # shape: (n_channels, n_samples)
+        eye_data = eye_segment.get_data()  # shape: (n_channels, n_samples)
+        
+        # Ресемплируем до expected_duration
+        resampled_eeg_data = resample(eeg_data, expected_duration, axis=1)
+        resampled_eye_data = resample(eye_data, expected_duration, axis=1)
+    
+        # Создаём новый RawArray с теми же метаданными
+        new_eeg_segment = mne.io.RawArray(resampled_eeg_data, eeg_segment.info, verbose=False)
+        new_eye_segment = mne.io.RawArray(resampled_eye_data, eye_segment.info, verbose=False)
+        execution_eeg_epochs.append(new_eeg_segment)
+        execution_eye_epochs.append(new_eye_segment)
+    
+        # Save
+        os.makedirs(save_path_training, exist_ok=True)
+        eeg_segment.save(f"{save_path_training}exec_EEG_{i+1}.fif", overwrite=True, verbose='ERROR')
+        eye_segment.save(f"{save_path_training}exec_EOG_{i+1}.fif", overwrite=True, verbose='ERROR')
+
+
+        
+    
+    # Загружаем геометрические паттерны как Python-объект из txt-файла
+    with open('./Supplementary/geometric_patterns.txt', 'r') as f:
+        geometric_patterns = ast.literal_eval(f.read())
+    
+    def gen_img(seed):
+        seed = seed % 2 ** 32
+        np.random.seed(seed)
+        img = 1 - np.random.randint(0, 2, size=(6, 6))
+        return img.tolist()
+    
+    execution_blocks = [
+        block_data
+        for block_data in experiment_seq.values()
+        if block_data['type'] == 'execution'
+    ]
+    
+    result = {"blocks": []}
+    
+    for i, block in enumerate(execution_blocks, start=1):
+        content = block["content"]
+        pattern_type = content["pattern_type"]
+        pattern_id = content["pattern_id"]
+    
+        block_entry = {
+            "Exec_Block_Index": i,
+            "type": pattern_type
+        }
+    
+        if pattern_type == "geometric":
+            block_entry["pattern_id"] = pattern_id
+            block_entry["img"] = geometric_patterns[pattern_id]
+        elif pattern_type == "random":
+            block_entry["seed"] = pattern_id
+            block_entry["img"] = gen_img(pattern_id)
+    
+        result["blocks"].append(block_entry)
+    
+    # Сохраняем результат в файл labels.json
+    with open(f'{save_path_training}labels.json', 'w') as outfile:
+        json.dump(result, outfile, indent=2)
+    
     print("Done!")
 
 

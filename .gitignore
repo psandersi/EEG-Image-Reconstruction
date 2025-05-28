@@ -1,12 +1,14 @@
 **/.ipynb_checkpoints/**
+**/__pycache__/**
 
 Datasets/Data
 Datasets/Target_Experiments_seq
 Generated/Data
+Generated/Data_Train
 topomap_frames
 
-
 eeg_channel.mp3
+eog_animation_30fps.mp4
 S_1_alpha_localization.png
 S_2_alpha_localization.png
 S_3_alpha_localization.png

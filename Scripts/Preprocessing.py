@@ -46,6 +46,8 @@ def preprocess(core_path):
 
     save_path_all = f"./Generated/Data/{s_name}/{trial_name}/"
     save_path_training = f"./Generated/Data_Train/{s_name}/{trial_name}/"
+
+    real_duration = 1560  # Adapted impirecally from experiment
     
     properties_path = f'{core_path}/EEG_Properties.json'
     datablocks_path = f'{core_path}/EEG.csv'
@@ -69,7 +71,7 @@ def preprocess(core_path):
     # Load experiment sequence
     with open(experiment_path,'r') as f:
         experiment_seq = json.load(f)
-        experiment_duration = sum(block['content'].get('duration') for block in experiment_seq.values())
+        expected_duration = sum(block['content'].get('duration') for block in experiment_seq.values())
     
     # Load eyetracker
     eye_raw = mne.io.read_raw_eyelink(eyetracker_path, verbose='ERROR')
@@ -121,7 +123,7 @@ def preprocess(core_path):
     
     
 
-    max_samples = sr * experiment_duration
+    max_samples = sr * real_duration
     
     # Trim EEG value to the experiment length
     eeg_len = int(min(max_samples, len(eeg_df)-1))
@@ -133,6 +135,69 @@ def preprocess(core_path):
     
     print(f"EEG len:\t{len(eeg_df)} samples\nEyetracker len:\t{len(eye_raw)} samples\nExpected len:\t{int(max_samples)} samples")
     
+
+
+
+    # Rename bad_blink to blink (хз почему конфликтует)
+    new_descriptions = ['blink' if desc == 'BAD_blink' else desc for desc in eye_raw.annotations.description]
+    eye_raw.set_annotations(mne.Annotations(onset=eye_raw.annotations.onset, duration=eye_raw.annotations.duration, description=new_descriptions, ch_names=eye_raw.annotations.ch_names))
+    annotations = eye_raw.annotations
+    sfreq = eye_raw.info['sfreq']
+    n_times = eye_raw.n_times
+    
+    # Создаём бинарные временные ряды
+    def create_event_channel(event_name):
+        signal = np.zeros(n_times)
+        for onset, duration, desc in zip(annotations.onset, annotations.duration, annotations.description):
+            if desc == event_name:
+                start = int(onset * sfreq)
+                end = int((onset + duration) * sfreq)
+                signal[start:end] = 1.0
+        return signal
+    
+    blink_signal = create_event_channel('blink')
+    saccade_signal = create_event_channel('saccade')
+    
+    # Извлекаем и нормализуем x, y, pupil
+    def zscore(x):
+        return (x - np.nanmean(x)) / np.nanstd(x)
+    
+    eye_x = eye_raw.get_data(picks='xpos_left')[0]
+    eye_y = eye_raw.get_data(picks='ypos_left')[0]
+    eye_pupil = eye_raw.get_data(picks='pupil_left')[0]
+    
+    # Нормализуем
+    # eye_x = zscore(eye_x)
+    # eye_y = zscore(eye_y)
+    # eye_pupil = zscore(eye_pupil)
+    
+    # Собираем всё вместе
+    data = np.vstack([
+        eye_x,
+        eye_y,
+        eye_pupil,
+        blink_signal,
+        saccade_signal
+    ])
+    
+    ch_names = ['EOG_x', 'EOG_y', 'EOG_pupil', 'EOG_blink', 'EOG_saccade']
+    ch_types = ['eog'] * len(ch_names)
+    
+    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
+    eye_raw = mne.io.RawArray(data, info)
+    
+    # Save all the experiment EOG
+    os.makedirs(save_path_all, exist_ok=True)
+    eye_raw.save(f'{save_path_all}EOG_clean.fif', overwrite=True, verbose='ERROR')
+
+
+
+
+
+
+
+
+
     
 
     
@@ -148,9 +213,71 @@ def preprocess(core_path):
     eeg_raw = mne.io.RawArray(eeg_data, info)
     montage = mne.channels.make_standard_montage('standard_1020')
     eeg_raw.set_montage(montage)
+
+
+
+
+
+
+    n_blocks = len(experiment_seq)
+    compensation = (real_duration - expected_duration) / n_blocks
+    print(f"Compensate {compensation:.3f} seconds per block")
     
 
 
+
+    # Конвертируем данные в массивы
+    data_eeg = eeg_raw.get_data()
+    data_eye = eye_raw.get_data()
+    
+    # Подготовим списки для хранения блоков
+    data_blocks_eeg = []
+    data_blocks_eye = []
+    
+    start_sample = 0
+    
+    for block_key in sorted(experiment_seq.keys(), key=lambda x: int(x.split('_')[1])):
+        block = experiment_seq[block_key]
+        duration = block['content']['duration']
+    
+        compensated_duration = duration + compensation
+    
+        compensated_samples = int(compensated_duration * sr)
+        
+        block_eeg = data_eeg[:, start_sample : start_sample + compensated_samples]
+        block_eye = data_eye[:, start_sample : start_sample + compensated_samples]
+    
+        # Handle none
+        block_eye = np.nan_to_num(block_eye, nan=0.0)
+    
+        target_samples = int(duration * sr)
+    
+        resampled_block_eeg = mne.filter.resample(block_eeg, up=target_samples, down=compensated_samples, npad='auto', axis=1)
+        resampled_block_eye = mne.filter.resample(block_eye, up=target_samples, down=compensated_samples, npad='auto', axis=1)
+    
+        # Бинаризация для EOG_blink и EOG_saccade
+        for ch_idx, ch_name in enumerate(eye_raw.ch_names):
+            if ch_name in ['EOG_blink', 'EOG_saccade']:
+                resampled_block_eye[ch_idx] = (resampled_block_eye[ch_idx] > 0.5).astype(int)
+        
+        data_blocks_eeg.append(resampled_block_eeg)
+        data_blocks_eye.append(resampled_block_eye)
+    
+        start_sample += compensated_samples
+    
+    # объединяем всё
+    new_data_eeg = np.hstack(data_blocks_eeg)
+    new_data_eye = np.hstack(data_blocks_eye)
+    
+    # создаём новые Raw объекты с укороченными и синхронизированными данными
+    eeg_raw = mne.io.RawArray(new_data_eeg, eeg_raw.info, verbose='ERROR')
+    eye_raw = mne.io.RawArray(new_data_eye, eye_raw.info, verbose='ERROR')
+    
+    print(f"EEG compensated length: \t {len(eeg_raw)} samples\nEytracker compensated length: \t {len(eye_raw)} samples")
+
+
+
+    
     
     # ----------------------------------------------------------  Refferencing ------------------------------------------------------------------------------------------------------------------
     eeg_raw.set_eeg_reference('average', projection=True)  # усредненная ссылка
@@ -165,38 +292,12 @@ def preprocess(core_path):
     
     
     # ---------------------------------------------------------- Remove eye artefacts ----------------------------------------------------------------------------------------------------------
-    # Rename bad_blink to blink (хз почему конфликтует)
-    new_descriptions = ['blink' if desc == 'BAD_blink' else desc for desc in eye_raw.annotations.description]
-    eye_raw.set_annotations(mne.Annotations(onset=eye_raw.annotations.onset, duration=eye_raw.annotations.duration, description=new_descriptions, ch_names=eye_raw.annotations.ch_names))
-    annotations = eye_raw.annotations
-    
-    # eye_x = eye_raw['xpos_left']
-    # eye_y = eye_raw['ypos_left']
-    
-    blink_times = annotations.onset[annotations.description == 'blink']
-    saccade_times = annotations.onset[annotations.description == 'saccade']
-    
-    # Получим времена из eeg_raw
-    times = eeg_raw.times
-    
-    # Создаем сигналы для морганий и саккад
-    blink_signal = np.zeros_like(times)
-    saccade_signal = np.zeros_like(times)
-    
-    # Заполняем сигнал морганий
-    for annot in annotations[annotations.description == 'blink']:
-        start = np.searchsorted(times, annot['onset'])
-        end = np.searchsorted(times, annot['onset'] + annot['duration'])
-        blink_signal[start:end] = 1
-    
-    # Заполняем сигнал саккад
-    for annot in annotations[annotations.description == 'saccade']:
-        start = np.searchsorted(times, annot['onset'])
-        end = np.searchsorted(times, annot['onset'] + annot['duration'])
-        saccade_signal[start:end] = 1
+    # Get binary signals for saccade and blink
+    blink_signal = eye_raw['EOG_blink'][0].squeeze()
+    saccade_signal = eye_raw['EOG_saccade'][0].squeeze()
     
     # Применяем ICA к EEG данным
-    ica = ICA(n_components=20, random_state=42, verbose='ERROR')
+    ica = ICA(n_components=20, random_state=42, verbose=False)
     ica.fit(eeg_raw)
     
     # Получаем ICA источники
@@ -234,7 +335,7 @@ def preprocess(core_path):
     ica.exclude = bads
     
     # Применяем ICA для очистки данных
-    eeg_raw = ica.apply(eeg_raw.copy(), verbose='ERROR')
+    eeg_raw = ica.apply(eeg_raw.copy(), verbose=False)
     
     
     # TODO --------------------------------------------------------------------------------------------------------
@@ -254,58 +355,6 @@ def preprocess(core_path):
     eeg_raw.save(f'{save_path_all}EEG_clean.fif', overwrite=True, verbose='ERROR')
     
     
-
-
-
-    annotations = eye_raw.annotations
-    sfreq = eye_raw.info['sfreq']
-    n_times = eye_raw.n_times
-    
-    # Создаём бинарные временные ряды
-    def create_event_channel(event_name):
-        signal = np.zeros(n_times)
-        for onset, duration, desc in zip(annotations.onset, annotations.duration, annotations.description):
-            if desc == event_name:
-                start = int(onset * sfreq)
-                end = int((onset + duration) * sfreq)
-                signal[start:end] = 1.0
-        return signal
-    
-    blink_signal = create_event_channel('blink')
-    saccade_signal = create_event_channel('saccade')
-    
-    # Извлекаем и нормализуем x, y, pupil
-    def zscore(x):
-        return (x - np.nanmean(x)) / np.nanstd(x)
-    
-    eye_x = eye_raw.get_data(picks='xpos_left')[0]
-    eye_y = eye_raw.get_data(picks='ypos_left')[0]
-    eye_pupil = eye_raw.get_data(picks='pupil_left')[0]
-    
-    eye_x = zscore(eye_x)
-    eye_y = zscore(eye_y)
-    eye_pupil = zscore(eye_pupil)
-    
-    # Собираем всё вместе
-    data = np.vstack([
-        eye_x,
-        eye_y,
-        eye_pupil,
-        blink_signal,
-        saccade_signal
-    ])
-    
-    ch_names = ['EOG_x', 'EOG_y', 'EOG_pupil', 'EOG_blink', 'EOG_saccade']
-    ch_types = ['eog'] * len(ch_names)
-    
-    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
-    eye_raw = mne.io.RawArray(data, info)
-    
-    # Save all the experiment EOG
-    eye_raw.save(f'{save_path_all}/EOG_clean.fif', overwrite=True, verbose='ERROR')
-
-
-
 
 
     
@@ -343,7 +392,8 @@ def preprocess(core_path):
             block_value['content']['pattern_id'] = pattern_trio[command_state][1]
     
     
-    
+
+
     timestamp = 0
     for block in sorted(experiment_seq.keys(), key=lambda x: int(x.split('_')[1])):
         block_data = experiment_seq[block]

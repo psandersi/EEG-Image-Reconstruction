@@ -3,13 +3,20 @@
 
 Datasets/Data
 Datasets/Target_Experiments_seq
+Generated/Figures/Spectral_Analysis/Temp
 Generated/Data
 Generated/Data_Train
 topomap_frames
+Notebooks/TEMP.ipynb
 
 eeg_channel.mp3
 eog_animation_30fps.mp4
+Alpha_Localization.png
+Beta_Localization.png
+Delta_Localization.png
+Theta_Localization.png
 S_1_alpha_localization.png
 S_2_alpha_localization.png
 S_3_alpha_localization.png
+S_3_T_1.png
 topomap_30Hz.gif

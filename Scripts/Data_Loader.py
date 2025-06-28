@@ -113,6 +113,15 @@ class EIRDataset:
             self.imgs[idx]           # numpy 6x6 array
         )
 
+    def __setitem__(self, idx, value):
+        eeg_sample, eye_sample, metadata_dict, label, img = value
+
+        self.eeg_arr[idx] = eeg_sample
+        self.eye_arr[idx] = eye_sample
+        self.suply_data.iloc[idx] = metadata_dict  # если нужно — или опустить, если не редактируется
+        self.labels[idx] = label
+        self.imgs[idx] = img
+
         
     def __len__(self):
         return len(self.suply_data)

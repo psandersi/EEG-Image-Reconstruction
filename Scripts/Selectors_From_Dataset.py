@@ -3,12 +3,13 @@ import os
 import warnings
 os.chdir('..')
 warnings.filterwarnings('ignore')
+from typing import Union
 
 # Firstly import the class of dataset
 from Scripts.Data_Loader import EIRDataset
 # function for getting samples on choosen subject id's
 # if get_pixel in format (x, y) specified will be returned only label for choosen pixel instead of full picture
-def get_sample(EIR_Dataset: EIRDataset, subj_id: int | list = None, get_pixel: bool | tuple = False):
+def get_sample(EIR_Dataset: EIRDataset, subj_id: Union[int, list] = None, get_pixel: Union[bool, tuple] = False):
     meta = []
     y = []
     X = []

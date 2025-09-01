@@ -1,11 +1,14 @@
 **/.ipynb_checkpoints/**
 **/__pycache__/**
 
+.venv
+
 Datasets/Data
 Datasets/Target_Experiments_seq
 Generated/Figures/Spectral_Analysis/Temp
 Generated/Spectrums/exec_morlets.npz
 Generated/Data
+Generated/Generated
 Generated/Data_Train
 topomap_frames
 Notebooks/TEMP.ipynb
